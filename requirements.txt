@@ -4,5 +4,6 @@ pandas
 plotly
 torch
 transformers
-librosa
 audio-recorder-streamlit
+groq
+python-dotenv

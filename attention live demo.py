@@ -1,7 +1,7 @@
-import io
+import hashlib
+import os
 import string
 
-import librosa
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -9,12 +9,12 @@ import torch
 from audio_recorder_streamlit import audio_recorder
 from plotly.subplots import make_subplots
 import streamlit as st
-from transformers import (
-    BertModel,
-    BertTokenizer,
-    WhisperForConditionalGeneration,
-    WhisperProcessor,
-)
+from dotenv import load_dotenv
+from groq import Groq
+from transformers import BertModel, BertTokenizer
+
+
+load_dotenv()
 
 
 st.set_page_config(
@@ -47,9 +47,11 @@ st.markdown(
 
 
 MODEL_NAME = "bert-large-uncased"
-WHISPER_MODEL_NAME = "openai/whisper-tiny.en"
-LAYER_TO_VISUALIZE = 20
-HEAD_TO_VISUALIZE = 7
+GROQ_WHISPER_MODEL = "whisper-large-v3"
+LAYER_TO_VISUALIZE = 14
+HEAD_TO_VISUALIZE = 5
+
+_groq_client = None
 
 
 MANUAL_TOKENS = ["robot", "ate", "apple"]
@@ -126,15 +128,78 @@ PITCH_WV = np.array(
 
 DEFAULT_SENTENCE = "The robot ate the apple because it was tasty."
 
-if "typed_text" not in st.session_state:
-    st.session_state["typed_text"] = DEFAULT_SENTENCE
+if "live_text" not in st.session_state:
+    st.session_state["live_text"] = DEFAULT_SENTENCE
+if "typed_text_input" not in st.session_state:
+    st.session_state["typed_text_input"] = st.session_state["live_text"]
 if "overflow_values" not in st.session_state:
     st.session_state["overflow_values"] = "100, 1000, 100"
+if "last_audio_signature" not in st.session_state:
+    st.session_state["last_audio_signature"] = None
+if "transcript_update" in st.session_state:
+    st.session_state["live_text"] = st.session_state["transcript_update"]
+    st.session_state["typed_text_input"] = st.session_state["transcript_update"]
+    del st.session_state["transcript_update"]
+
+
+def handle_manual_text_change():
+    st.session_state["live_text"] = st.session_state.get("typed_text_input", "")
+
+
+def get_groq_client() -> Groq | None:
+    global _groq_client
+    if _groq_client is not None:
+        return _groq_client
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        st.error("GROQ_API_KEY is not set; cannot run audio transcription.")
+        return None
+    _groq_client = Groq(api_key=api_key)
+    return _groq_client
+
+
+def groq_transcribe_audio(audio_bytes: bytes) -> str:
+    if not audio_bytes:
+        return ""
+    client = get_groq_client()
+    if client is None:
+        return ""
+    try:
+        transcription = client.audio.transcriptions.create(
+            file=("audio.wav", audio_bytes),
+            model=GROQ_WHISPER_MODEL,
+            temperature=0,
+            response_format="verbose_json",
+        )
+    except Exception as exc:
+        st.error(f"Groq transcription failed: {exc}")
+        return ""
+    text = getattr(transcription, "text", "") or ""
+    if not text:
+        segments = getattr(transcription, "segments", None) or []
+        text = " ".join(getattr(seg, "text", "") for seg in segments)
+    return text.strip()
+
+
+def maybe_transcribe_audio(audio_bytes: bytes):
+    if not audio_bytes:
+        return
+    signature = hashlib.sha1(audio_bytes).hexdigest()
+    if st.session_state.get("last_audio_signature") == signature:
+        return
+    st.session_state["last_audio_signature"] = signature
+    with st.spinner("Transcribing audio via Groq Whisper..."):
+        text = groq_transcribe_audio(audio_bytes)
+    if text:
+        st.session_state["transcript_update"] = text
+        st.toast("Transcript updated from audio", icon="🎙️")
+        st.rerun()
 
 
 def softmax(x: np.ndarray) -> np.ndarray:
     x = x - np.max(x, axis=-1, keepdims=True)
-    exp_x = np.exp(x)
+    with np.errstate(over="ignore"):
+        exp_x = np.exp(x)
     return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
 
 
@@ -167,15 +232,31 @@ def tiny_attention(
     }
 
 
+def make_unique_labels(labels):
+    counts = {}
+    unique = []
+    for idx, label in enumerate(labels):
+        key = label if label not in (None, "") else f"item_{idx+1}"
+        count = counts.get(key, 0)
+        counts[key] = count + 1
+        if count:
+            unique.append(f"{key}_{count+1}")
+        else:
+            unique.append(key)
+    return unique
+
+
 def matrix_df(matrix, row_labels, col_labels):
-    df = pd.DataFrame(np.round(matrix, 3), index=row_labels, columns=col_labels)
+    rows = make_unique_labels(row_labels)
+    cols = make_unique_labels(col_labels)
+    df = pd.DataFrame(np.round(matrix, 3), index=rows, columns=cols)
     return df
 
 
 def render_matrix(title, matrix, row_labels, col_labels):
     st.markdown(f"**{title}**")
     df = matrix_df(matrix, row_labels, col_labels)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
     st.caption(f"shape = {matrix.shape[0]} x {matrix.shape[1]}")
 
 
@@ -200,7 +281,7 @@ def attention_heatmap(weights, tokens, title, height=420):
         height=height,
         margin=dict(l=0, r=0, b=0, t=40),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def scanning_plot(scores, tokens, query_idx, title):
@@ -229,35 +310,7 @@ def load_transformer_models():
     tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
     bert_model = BertModel.from_pretrained(MODEL_NAME, output_attentions=True)
     bert_model.eval()
-
-    whisper_processor = WhisperProcessor.from_pretrained(WHISPER_MODEL_NAME)
-    whisper_model = WhisperForConditionalGeneration.from_pretrained(WHISPER_MODEL_NAME)
-    whisper_model.eval()
-
-    return tokenizer, bert_model, whisper_processor, whisper_model
-
-
-def transcribe_audio_bytes(audio_bytes, whisper_processor, whisper_model):
-    if not audio_bytes:
-        return ""
-    try:
-        audio_file = io.BytesIO(audio_bytes)
-        audio_data, _ = librosa.load(audio_file, sr=16000, mono=True)
-        audio_data = librosa.util.normalize(audio_data)
-        inputs = whisper_processor(audio_data, sampling_rate=16000, return_tensors="pt")
-        decoder_prompt = whisper_processor.get_decoder_prompt_ids(language="en", task="transcribe")
-        with torch.no_grad():
-            predicted_ids = whisper_model.generate(
-                inputs.input_features,
-                forced_decoder_ids=decoder_prompt,
-                max_new_tokens=128,
-            )
-        text = whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-        return text.strip()
-    except Exception as exc:
-        st.error(f"Whisper transcription failed: {exc}")
-        return ""
-
+    return tokenizer, bert_model
 
 def get_head_details(text, tokenizer, model, layer_idx, head_idx):
     clean_text = (text or "").strip()
@@ -441,9 +494,11 @@ def gradient_figure():
 
 def overflow_demo(values):
     arr = np.array(values, dtype=float)
-    raw_exp = np.exp(arr)
+    with np.errstate(over="ignore"):
+        raw_exp = np.exp(arr)
     shifted = arr - np.max(arr)
-    safe_exp = np.exp(shifted)
+    with np.errstate(over="ignore"):
+        safe_exp = np.exp(shifted)
     stable = safe_exp / np.sum(safe_exp)
     return raw_exp, shifted, safe_exp, stable
 
@@ -546,7 +601,7 @@ def render_walkthrough(details, token_display_limit, feature_display_dim, query_
         query_idx,
         f"Dot products for query '{chosen_query}'",
     )
-    st.plotly_chart(scan_fig, use_container_width=True)
+    st.plotly_chart(scan_fig, width="stretch")
 
     st.markdown("#### Context-rich output (weights @ V)")
     render_matrix(
@@ -562,16 +617,17 @@ st.caption("A 3-part walkthrough for math-focused presentations")
 
 st.header("Interactive Transformer Attention Explorer")
 st.write(
-    "Record or upload speech (Whisper handles the transcript) or type text manually, then"
-    " inspect a BERT attention head in real time while rerunning the linear-algebra walkthrough."
+    "Record or upload speech (Groq Whisper handles the transcript) or type text manually;"
+    " every new word immediately refreshes the attention visualizations and math walkthrough."
 )
 
-with st.spinner("Loading BERT and Whisper models..."):
-    tokenizer, bert_model, whisper_processor, whisper_model = load_transformer_models()
-st.success("Models ready. Use the fixed left panel to tweak inputs while the right panel updates immediately.")
+with st.spinner("Loading BERT model..."):
+    tokenizer, bert_model = load_transformer_models()
+st.success("BERT ready. Use the fixed left panel while Groq Whisper + manual text updates rerun everything automatically.")
 
 head_details = None
 selected_query = None
+typed_text_value = st.session_state["live_text"].strip()
 
 with st.sidebar:
     st.header("Control panel")
@@ -590,9 +646,13 @@ with st.sidebar:
     head_idx = st.slider("Head index", 0, max_head_idx, head_default)
 
     st.markdown("##### Type or paste text")
-    typed_input = st.text_area("Sentence", key="typed_text", height=160)
-    typed_text_value = typed_input.strip()
-    st.caption("The same text drives both BERT and the NumPy walkthrough.")
+    st.text_area(
+        "Sentence",
+        key="typed_text_input",
+        height=160,
+        on_change=handle_manual_text_change,
+    )
+    st.caption("Typing triggers instant attention + math updates.")
 
     st.markdown("##### Record or upload speech")
     audio_bytes = audio_recorder(text="Click to record", icon_size="2x")
@@ -607,22 +667,12 @@ with st.sidebar:
         st.audio(audio_bytes, format="audio/wav")
     if uploaded_bytes:
         st.audio(uploaded_bytes, format=audio_mime)
-    if st.button("Transcribe audio to text", key="audio_to_text"):
-        selected_audio = audio_bytes or uploaded_bytes
-        if not selected_audio:
-            st.warning("Record or upload audio first.")
-        else:
-            with st.spinner("Running Whisper transcription..."):
-                transcription = transcribe_audio_bytes(
-                    selected_audio,
-                    whisper_processor,
-                    whisper_model,
-                )
-            if transcription:
-                st.session_state["typed_text"] = transcription
-                st.success("Transcribed audio and updated the textbox.")
-                st.experimental_rerun()
+    new_audio_bytes = audio_bytes or uploaded_bytes
+    if new_audio_bytes:
+        maybe_transcribe_audio(new_audio_bytes)
+    st.caption("New recordings/uploads auto-transcribe via Groq Whisper.")
 
+    st.markdown("##### Display controls")
     if typed_text_value:
         head_details = get_head_details(
             typed_text_value,
@@ -633,8 +683,6 @@ with st.sidebar:
         )
     else:
         head_details = None
-
-    st.markdown("##### Display controls")
     token_display_limit = st.slider("Max tokens to display", 2, 20, 8)
     feature_display_dim = st.slider("Feature columns to display", 2, 16, 6)
 
@@ -662,7 +710,6 @@ with st.sidebar:
     )
     st.session_state["overflow_values"] = overflow_values_text
 
-typed_text_value = st.session_state["typed_text"].strip()
 st.header("I. Introduction and Motivation")
 st.markdown(
     """
@@ -722,11 +769,11 @@ var_fig.update_layout(
     font_color="#E2E8F0",
     height=420,
 )
-st.plotly_chart(var_fig, use_container_width=True)
+st.plotly_chart(var_fig, width="stretch")
 st.caption("Without the scaling, variance grows linearly with d_k and softmax saturates.")
 
 st.subheader("2. Gradients vanish when softmax saturates")
-st.plotly_chart(gradient_figure(), use_container_width=True)
+st.plotly_chart(gradient_figure(), width="stretch")
 st.caption("Large logits push probabilities to 0/1, so d softmax / d logit approaches 0 and learning stalls.")
 
 st.subheader("3. The subtract-max trick prevents overflow")
@@ -763,24 +810,24 @@ with col1:
         height=500,
     )
     st.caption("Row 'it' peaks at column 'apple', the point you want on your slide.")
-with col2:
-    manual_result = tiny_attention(
-        MANUAL_TOKENS,
-        MANUAL_X,
-        MANUAL_WQ,
-        MANUAL_WK,
-        MANUAL_WV,
-    )
-    robot_idx = MANUAL_TOKENS.index("robot")
-    st.plotly_chart(
-        scanning_plot(
-            manual_result["scores"],
+    with col2:
+        manual_result = tiny_attention(
             MANUAL_TOKENS,
-            robot_idx,
-            "q(robot) scanning k(.)",
-        ),
-        use_container_width=True,
-    )
+            MANUAL_X,
+            MANUAL_WQ,
+            MANUAL_WK,
+            MANUAL_WV,
+        )
+        robot_idx = MANUAL_TOKENS.index("robot")
+        st.plotly_chart(
+            scanning_plot(
+                manual_result["scores"],
+                MANUAL_TOKENS,
+                robot_idx,
+                "q(robot) scanning k(.)",
+            ),
+            width="stretch",
+        )
     st.caption("This bar chart is the scanning diagram: dot products pop out for each comparison.")
 
 st.info(
