@@ -1,0 +1,8 @@
+streamlit
+numpy
+pandas
+plotly
+torch
+transformers
+librosa
+audio-recorder-streamlit
